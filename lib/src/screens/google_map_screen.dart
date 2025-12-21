@@ -1,33 +1,36 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:sports_chat_app/src/screens/create_club_screen.dart';
 import 'package:sports_chat_app/src/screens/club_profile_screen.dart';
 import 'package:sports_chat_app/src/screens/location_picker_screen.dart';
+import 'package:sports_chat_app/src/services/platform_service.dart';
+import 'package:sports_chat_app/src/services/remote_config_service.dart';
 import 'dart:math';
 
-class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+class GoogleMapScreen extends StatefulWidget {
+  const GoogleMapScreen({super.key});
 
   @override
-  State<MapScreen> createState() => _MapScreenState();
+  State<GoogleMapScreen> createState() => _GoogleMapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> {
-  MapController? _mapController;
+class _GoogleMapScreenState extends State<GoogleMapScreen> {
+  GoogleMapController? _mapController;
   double _searchRadius = 5.0;
   String _selectedSport = 'All';
 
-  LatLng _currentLocation = const LatLng(24.8607, 67.0011); // Karachi (safe default)
-  final List<Marker> _markers = [];
-  final List<CircleMarker> _circles = [];
+  LatLng _currentLocation = const LatLng(24.8607, 67.0011);
+  final Set<Marker> _markers = {};
+  final Set<Circle> _circles = {};
   bool _isLoadingLocation = false;
+  bool _mapsInitialized = false;
 
   final _auth = FirebaseAuth.instance;
   final _firestore = FirebaseFirestore.instance;
+  final _remoteConfig = RemoteConfigService();
   List<Map<String, dynamic>> _adminClubs = [];
   bool _isLoadingClubs = false;
   List<Map<String, dynamic>> _clubsInRadius = [];
@@ -35,29 +38,102 @@ class _MapScreenState extends State<MapScreen> {
   @override
   void initState() {
     super.initState();
+    _initializeServices();
+  }
+
+  Future<void> _initializeServices() async {
+    if (!_remoteConfig.isInitialized) {
+      try {
+        await _remoteConfig.initialize();
+      } catch (e) {
+        debugPrint('Error initializing Remote Config: $e');
+        _showErrorDialog('Configuration Error', 'Failed to load app configuration.');
+        return;
+      }
+    }
+
+    final apiKey = _remoteConfig.googleMapsApiKey;
+    debugPrint('Maps API Key loaded: ${apiKey.isNotEmpty ? "${apiKey.substring(0, 10)}..." : "Empty"}');
+
+    if (apiKey.isEmpty) {
+      _showErrorDialog('Maps Configuration Error', 'Google Maps API key is not configured.');
+      return;
+    }
+
+    try {
+      await PlatformService.setMapsApiKey(apiKey);
+      setState(() {
+        _mapsInitialized = true;
+      });
+    } catch (e) {
+      debugPrint('Error setting Maps API key: $e');
+      _showErrorDialog('Maps Error', 'Failed to initialize maps.');
+      return;
+    }
+
     _getCurrentLocation();
+  }
+
+  void _showErrorDialog(String title, String message) {
+    if (mounted) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  void _onMapCreated(GoogleMapController controller) {
+    if (!mounted) return;
+    _mapController = controller;
+
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (mounted && _mapController != null) {
+        _updateSearchCircle();
+        _loadClubMarkers();
+      }
+    });
   }
 
   void _updateSearchCircle() {
     if (!mounted) return;
-    
+
     try {
       setState(() {
         _circles.clear();
         _circles.add(
-          CircleMarker(
-            point: _currentLocation,
+          Circle(
+            circleId: const CircleId('search_radius'),
+            center: _currentLocation,
             radius: _searchRadius * 1000,
-            useRadiusInMeter: true,
-            color: const Color(0xFFFF8C00).withValues(alpha: 0.1),
-            borderStrokeWidth: 2,
-            borderColor: const Color(0xFFFF8C00),
+            fillColor: const Color(0xFFFF8C00).withValues(alpha: 0.1),
+            strokeColor: const Color(0xFFFF8C00),
+            strokeWidth: 2,
           ),
         );
       });
-      
+
       if (_mapController != null) {
-        _mapController!.move(_currentLocation, 13.0);
+        double zoomLevel = 15.0 - (_searchRadius / 5.0);
+        zoomLevel = zoomLevel.clamp(10.0, 18.0);
+
+        _mapController!.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: _currentLocation,
+              zoom: zoomLevel,
+            ),
+          ),
+        );
       }
     } catch (e) {
       debugPrint('Error updating search circle: $e');
@@ -129,7 +205,14 @@ class _MapScreenState extends State<MapScreen> {
       await _loadClubMarkers();
 
       if (_mapController != null) {
-        _mapController!.move(_currentLocation, 13.0);
+        _mapController!.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: _currentLocation,
+              zoom: 15.0,
+            ),
+          ),
+        );
       }
     } catch (e) {
       setState(() => _isLoadingLocation = false);
@@ -188,20 +271,11 @@ class _MapScreenState extends State<MapScreen> {
       _markers.clear();
       _clubsInRadius = [];
 
-      // Add current location marker
       _markers.add(
         Marker(
-          point: _currentLocation,
-          width: 40,
-          height: 40,
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF2196F3),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 2),
-            ),
-            child: const Icon(Icons.location_on, color: Colors.white, size: 20),
-          ),
+          markerId: const MarkerId('my_location'),
+          position: _currentLocation,
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue),
         ),
       );
 
@@ -240,20 +314,10 @@ class _MapScreenState extends State<MapScreen> {
 
         _markers.add(
           Marker(
-            point: LatLng(latitude, longitude),
-            width: 40,
-            height: 40,
-            child: GestureDetector(
-              onTap: () => _showClubDetails(doc.id),
-              child: Container(
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFF8C00),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                ),
-                child: const Icon(Icons.location_on, color: Colors.white, size: 20),
-              ),
-            ),
+            markerId: MarkerId('club_${doc.id}'),
+            position: LatLng(latitude, longitude),
+            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+            onTap: () => _showClubDetails(doc.id),
           ),
         );
       }
@@ -573,25 +637,31 @@ class _MapScreenState extends State<MapScreen> {
     return Scaffold(
       body: Stack(
         children: [
-          // OpenStreetMap
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: _currentLocation,
-              initialZoom: 13.0,
-              minZoom: 5.0,
-              maxZoom: 18.0,
-            ),
-            children: [
-              TileLayer(
-                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                userAgentPackageName: 'com.sprintindex.app',
+          if (_mapsInitialized)
+            SizedBox.expand(
+              child: GoogleMap(
+                onMapCreated: _onMapCreated,
+                initialCameraPosition: const CameraPosition(
+                  target: LatLng(24.8607, 67.0011),
+                  zoom: 11.0,
+                ),
+                markers: _markers,
+                circles: _circles,
+                myLocationEnabled: true,
+                myLocationButtonEnabled: true,
+                zoomControlsEnabled: true,
+                mapToolbarEnabled: false,
               ),
-              CircleLayer(circles: _circles),
-              MarkerLayer(markers: _markers),
-            ],
-          ),
-          // Top controls
+            )
+          else
+            Container(
+              color: Colors.grey[200],
+              child: const Center(
+                child: CircularProgressIndicator(
+                  color: Color(0xFFFF8C00),
+                ),
+              ),
+            ),
           SafeArea(
             child: Column(
               children: [
@@ -733,8 +803,7 @@ class _MapScreenState extends State<MapScreen> {
                                   value: _selectedSport,
                                   isExpanded: true,
                                   underline: const SizedBox(),
-                                  icon: const Icon(Icons.keyboard_arrow_down,
-                                      size: 18),
+                                  icon: const Icon(Icons.keyboard_arrow_down, size: 18),
                                   items: [
                                     'All',
                                     'Football',
@@ -805,7 +874,6 @@ class _MapScreenState extends State<MapScreen> {
               ],
             ),
           ),
-          // My Location Button
           Positioned(
             right: 16,
             bottom: 100,
